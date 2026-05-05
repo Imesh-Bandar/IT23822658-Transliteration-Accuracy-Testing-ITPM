@@ -9,14 +9,14 @@ import openpyxl
 from openpyxl.cell.cell import MergedCell
 
 # Configuration
-ROOT_DIR = Path(__file__).resolve().parent.parent
-TESTS_DIR = ROOT_DIR / "test_automation"
+ROOT_DIR = Path(__file__).resolve().parent
 
 DEFAULT_EXCEL_CANDIDATES = [
-    str(TESTS_DIR / "Assignment 1 - Test cases.xlsx"),
+    str(ROOT_DIR / "IT23822658 - Assignment 1 - Test cases.xlsx"),
+    str(ROOT_DIR / "Assignment 1 - Test cases.xlsx"),
 ]
 
-DEFAULT_SHEET_NAME = " Test cases"
+DEFAULT_SHEET_NAME = ""
 DEFAULT_FRONTEND_URL = os.getenv("FRONTEND_URL", "https://www.pixelssuite.com/chat-translator")
 
 DEFAULT_INPUT_COLUMN_CANDIDATES = [
@@ -80,9 +80,6 @@ def _resolve_path(p: str | None) -> str | None:
     root_candidate = (ROOT_DIR / path).resolve()
     if root_candidate.exists():
         return str(root_candidate)
-    tests_candidate = (TESTS_DIR / path).resolve()
-    if tests_candidate.exists():
-        return str(tests_candidate)
     return str(root_candidate)
 
 def _normalize_header(value) -> str:
@@ -169,24 +166,35 @@ def _find_column_index(header_values: list, requested_name: str | None, candidat
         if n and n not in norm_to_index:
             norm_to_index[n] = i
 
-    def match(name: str) -> int | None:
+    def exact_match(name: str) -> int | None:
+        n = _normalize_header(name)
+        return norm_to_index.get(n) if n else None
+
+    def substring_match(name: str) -> int | None:
         n = _normalize_header(name)
         if not n:
             return None
-        if n in norm_to_index:
-            return norm_to_index[n]
         for i, v in indexed:
-            if n in _normalize_header(v) or _normalize_header(v) in n:
+            hv = _normalize_header(v)
+            # Only match if the candidate is at least 60% of the header length to avoid false positives
+            if hv == n or (len(n) >= 4 and hv.startswith(n) and len(n) >= len(hv) * 0.6):
                 return i
         return None
 
+    all_names = []
     if requested_name:
-        found = match(requested_name)
+        all_names.append(requested_name)
+    all_names.extend(candidates)
+
+    # First pass: exact matches only (across all candidates)
+    for name in all_names:
+        found = exact_match(name)
         if found:
             return found
 
-    for c in candidates:
-        found = match(c)
+    # Second pass: prefix/substring matches
+    for name in all_names:
+        found = substring_match(name)
         if found:
             return found
 
@@ -455,17 +463,48 @@ def run_test():
             return
 
         is_chat = "chat-translator" in (args.url or "")
-        if is_chat:
+
+        def _setup_locators(pg):
+            if is_chat:
+                inp, out, act = _find_chat_locators(pg, int(args.timeout_ms))
+            else:
+                inp = pg.locator("textarea")
+                out = pg.locator("div.card").filter(has_text=re.compile(r"\bSinhala\b")).locator("div.bg-slate-50").first
+                act = None
+            return inp, out, act
+
+        def _navigate_and_setup(pg):
+            pg.goto(args.url, wait_until="domcontentloaded")
             try:
-                input_locator, output_locator, action_locator = _find_chat_locators(page, int(args.timeout_ms))
+                pg.wait_for_load_state("networkidle", timeout=max(1000, int(args.timeout_ms)))
+            except Exception:
+                pass
+            pg.wait_for_selector("textarea", timeout=max(1000, int(args.timeout_ms)))
+            return _setup_locators(pg)
+
+        try:
+            input_locator, output_locator, action_locator = _setup_locators(page)
+        except Exception as e:
+            print(f"Error locating chat UI elements: {e}")
+            browser.close()
+            return
+
+        def _ensure_page_alive():
+            nonlocal page, input_locator, output_locator, action_locator
+            try:
+                if not page.is_closed():
+                    return True
+            except Exception:
+                pass
+            print("  [page closed — reopening...]")
+            try:
+                page = browser.new_page()
+                page.set_default_timeout(max(1000, int(args.timeout_ms)))
+                input_locator, output_locator, action_locator = _navigate_and_setup(page)
+                return True
             except Exception as e:
-                print(f"Error locating chat UI elements: {e}")
-                browser.close()
-                return
-        else:
-            input_locator = page.locator("textarea")
-            output_locator = page.locator("div.card").filter(has_text=re.compile(r"\\bSinhala\\b")).locator("div.bg-slate-50").first
-            action_locator = None
+                print(f"  [failed to reopen page: {e}]")
+                return False
 
         # 4. Iterate Rows
         processed = 0
@@ -486,6 +525,13 @@ def run_test():
 
             print(f"Testing [Row {row_index}]: {singlish_input}")
 
+            if not _ensure_page_alive():
+                try:
+                    _set_cell_value(ws, row_index, status_col_idx, "UI Error")
+                except Exception:
+                    pass
+                continue
+
             try:
                 _dismiss_overlays(page)
                 prev_output = _read_output(is_chat, output_locator)
@@ -495,7 +541,7 @@ def run_test():
                     action_locator.click()
 
                 page.wait_for_timeout(max(0, int(args.wait_ms)))
-                
+
                 # Wait for visible content - retry a few times if empty
                 actual_output = ""
                 tries = max(1, int(args.retries))
@@ -526,7 +572,7 @@ def run_test():
                 processed += 1
                 if args.save_every and int(args.save_every) > 0 and processed % int(args.save_every) == 0:
                     wb.save(args.output)
-                
+
             except Exception as e:
                 print(f"Error in UI interaction: {e}")
                 try:
