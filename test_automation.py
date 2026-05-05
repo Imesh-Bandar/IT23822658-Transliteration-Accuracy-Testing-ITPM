@@ -3,20 +3,21 @@ import time
 import os
 import argparse
 import re
+import unicodedata
 from pathlib import Path
 import sys
 import openpyxl
 from openpyxl.cell.cell import MergedCell
 
 # Configuration
+# ROOT_DIR = the folder that contains test_automation.py itself
 ROOT_DIR = Path(__file__).resolve().parent
 
 DEFAULT_EXCEL_CANDIDATES = [
-    str(ROOT_DIR / "IT23822658 - Assignment 1 - Test cases.xlsx"),
     str(ROOT_DIR / "Assignment 1 - Test cases.xlsx"),
 ]
 
-DEFAULT_SHEET_NAME = ""
+DEFAULT_SHEET_NAME = " Test cases"
 DEFAULT_FRONTEND_URL = os.getenv("FRONTEND_URL", "https://www.pixelssuite.com/chat-translator")
 
 DEFAULT_INPUT_COLUMN_CANDIDATES = [
@@ -74,13 +75,23 @@ def _pick_existing_path(candidates):
 def _resolve_path(p: str | None) -> str | None:
     if not p:
         return None
+    # Strip accidental leading/trailing whitespace
+    p = p.strip()
     path = Path(p)
     if path.is_absolute():
         return str(path)
-    root_candidate = (ROOT_DIR / path).resolve()
-    if root_candidate.exists():
-        return str(root_candidate)
-    return str(root_candidate)
+    # Direct relative to script dir
+    script_candidate = (ROOT_DIR / path).resolve()
+    if script_candidate.exists():
+        return str(script_candidate)
+    # Strip a leading "test_automation/" or "test_automation\" prefix that
+    # appears in the assignment instructions when already inside the folder
+    stripped = re.sub(r"(?i)^test[_\-\s]automation[\\/]\s*", "", p).strip()
+    if stripped and stripped != p:
+        stripped_candidate = (ROOT_DIR / stripped).resolve()
+        if stripped_candidate.exists():
+            return str(stripped_candidate)
+    return str(script_candidate)
 
 def _normalize_header(value) -> str:
     if value is None:
@@ -166,35 +177,24 @@ def _find_column_index(header_values: list, requested_name: str | None, candidat
         if n and n not in norm_to_index:
             norm_to_index[n] = i
 
-    def exact_match(name: str) -> int | None:
-        n = _normalize_header(name)
-        return norm_to_index.get(n) if n else None
-
-    def substring_match(name: str) -> int | None:
+    def match(name: str) -> int | None:
         n = _normalize_header(name)
         if not n:
             return None
+        if n in norm_to_index:
+            return norm_to_index[n]
         for i, v in indexed:
-            hv = _normalize_header(v)
-            # Only match if the candidate is at least 60% of the header length to avoid false positives
-            if hv == n or (len(n) >= 4 and hv.startswith(n) and len(n) >= len(hv) * 0.6):
+            if n in _normalize_header(v) or _normalize_header(v) in n:
                 return i
         return None
 
-    all_names = []
     if requested_name:
-        all_names.append(requested_name)
-    all_names.extend(candidates)
-
-    # First pass: exact matches only (across all candidates)
-    for name in all_names:
-        found = exact_match(name)
+        found = match(requested_name)
         if found:
             return found
 
-    # Second pass: prefix/substring matches
-    for name in all_names:
-        found = substring_match(name)
+    for c in candidates:
+        found = match(c)
         if found:
             return found
 
@@ -288,15 +288,26 @@ def _ensure_input_value(page, input_locator, text: str, type_delay_ms: int):
     input_locator.fill(text)
 
 def _read_output(is_chat: bool, output_locator) -> str:
-    if is_chat:
-        try:
-            v = output_locator.input_value()
-            if v is not None:
-                v = str(v).strip()
-                if v:
-                    return v
-        except Exception:
-            pass
+    """Read visible text from an output element (textarea or div)."""
+    # 1. Try via JS .value — works for read-only textareas too
+    try:
+        v = output_locator.evaluate("(el) => el && ('value' in el ? el.value : '')")
+        if v is not None:
+            v = str(v).strip()
+            if v:
+                return v
+    except Exception:
+        pass
+    # 2. input_value (writable textareas)
+    try:
+        v = output_locator.input_value()
+        if v is not None:
+            v = str(v).strip()
+            if v:
+                return v
+    except Exception:
+        pass
+    # 3. inner_text
     try:
         v = output_locator.inner_text()
         if v is not None:
@@ -305,16 +316,9 @@ def _read_output(is_chat: bool, output_locator) -> str:
                 return v
     except Exception:
         pass
+    # 4. text_content
     try:
         v = output_locator.text_content()
-        if v is not None:
-            v = str(v).strip()
-            if v:
-                return v
-    except Exception:
-        pass
-    try:
-        v = output_locator.evaluate("(el) => el && ('value' in el ? el.value : '')")
         if v is not None:
             v = str(v).strip()
             if v:
@@ -397,9 +401,26 @@ def run_test():
     args.excel = _resolve_path(args.excel)
     args.output = _resolve_path(args.output) if args.output else args.excel
 
+    print(f"Excel file path: {args.excel}")
+
     if not args.excel or not os.path.exists(args.excel):
-        print(f"Error: File '{args.excel}' not found.")
-        return
+        # Last resort: scan ROOT_DIR for any .xlsx
+        fallback = None
+        for f in ROOT_DIR.iterdir():
+            if f.suffix.lower() == ".xlsx":
+                fallback = str(f)
+                break
+        if fallback:
+            print(f"Warning: '{args.excel}' not found. Using fallback: '{fallback}'")
+            args.excel = fallback
+            args.output = fallback
+        else:
+            print(f"Error: File '{args.excel}' not found.")
+            print(f"Script directory: {ROOT_DIR}")
+            print("Files in script directory:")
+            for f in ROOT_DIR.iterdir():
+                print(f"  {f.name}")
+            return
 
     try:
         wb = openpyxl.load_workbook(args.excel)
@@ -463,48 +484,17 @@ def run_test():
             return
 
         is_chat = "chat-translator" in (args.url or "")
-
-        def _setup_locators(pg):
-            if is_chat:
-                inp, out, act = _find_chat_locators(pg, int(args.timeout_ms))
-            else:
-                inp = pg.locator("textarea")
-                out = pg.locator("div.card").filter(has_text=re.compile(r"\bSinhala\b")).locator("div.bg-slate-50").first
-                act = None
-            return inp, out, act
-
-        def _navigate_and_setup(pg):
-            pg.goto(args.url, wait_until="domcontentloaded")
+        if is_chat:
             try:
-                pg.wait_for_load_state("networkidle", timeout=max(1000, int(args.timeout_ms)))
-            except Exception:
-                pass
-            pg.wait_for_selector("textarea", timeout=max(1000, int(args.timeout_ms)))
-            return _setup_locators(pg)
-
-        try:
-            input_locator, output_locator, action_locator = _setup_locators(page)
-        except Exception as e:
-            print(f"Error locating chat UI elements: {e}")
-            browser.close()
-            return
-
-        def _ensure_page_alive():
-            nonlocal page, input_locator, output_locator, action_locator
-            try:
-                if not page.is_closed():
-                    return True
-            except Exception:
-                pass
-            print("  [page closed — reopening...]")
-            try:
-                page = browser.new_page()
-                page.set_default_timeout(max(1000, int(args.timeout_ms)))
-                input_locator, output_locator, action_locator = _navigate_and_setup(page)
-                return True
+                input_locator, output_locator, action_locator = _find_chat_locators(page, int(args.timeout_ms))
             except Exception as e:
-                print(f"  [failed to reopen page: {e}]")
-                return False
+                print(f"Error locating chat UI elements: {e}")
+                browser.close()
+                return
+        else:
+            input_locator = page.locator("textarea")
+            output_locator = page.locator("div.card").filter(has_text=re.compile(r"\\bSinhala\\b")).locator("div.bg-slate-50").first
+            action_locator = None
 
         # 4. Iterate Rows
         processed = 0
@@ -525,13 +515,6 @@ def run_test():
 
             print(f"Testing [Row {row_index}]: {singlish_input}")
 
-            if not _ensure_page_alive():
-                try:
-                    _set_cell_value(ws, row_index, status_col_idx, "UI Error")
-                except Exception:
-                    pass
-                continue
-
             try:
                 _dismiss_overlays(page)
                 prev_output = _read_output(is_chat, output_locator)
@@ -541,7 +524,7 @@ def run_test():
                     action_locator.click()
 
                 page.wait_for_timeout(max(0, int(args.wait_ms)))
-
+                
                 # Wait for visible content - retry a few times if empty
                 actual_output = ""
                 tries = max(1, int(args.retries))
@@ -564,15 +547,24 @@ def run_test():
                 _set_cell_value(ws, row_index, actual_col_idx, actual_output)
 
                 if expected_sinhala:
-                    status = "PASS" if actual_output == expected_sinhala else "FAIL"
+                    # Normalize both strings with Unicode NFC so invisible
+                    # zero-width chars or alternative code-point representations
+                    # don't cause false PASSes.
+                    norm_actual   = unicodedata.normalize("NFC", actual_output.strip())
+                    norm_expected = unicodedata.normalize("NFC", expected_sinhala.strip())
+                    status = "PASS" if norm_actual == norm_expected else "FAIL"
+                    if status == "PASS":
+                        # Extra debug: print codepoints so you can spot hidden differences
+                        print(f"  [DEBUG PASS] actual   : {repr(norm_actual)}")
+                        print(f"  [DEBUG PASS] expected : {repr(norm_expected)}")
                 else:
                     status = "COLLECTED"
                 _set_cell_value(ws, row_index, status_col_idx, status)
-                print(f"  -> {status}")
+                print(f"  -> {status}  | actual='{actual_output[:60]}' | expected='{expected_sinhala[:60]}'")
                 processed += 1
                 if args.save_every and int(args.save_every) > 0 and processed % int(args.save_every) == 0:
                     wb.save(args.output)
-
+                
             except Exception as e:
                 print(f"Error in UI interaction: {e}")
                 try:
@@ -588,18 +580,28 @@ def run_test():
         if args.keep_open and not args.headless:
             try:
                 wb.save(args.output)
+                print(f"[Saved] Results written to '{args.output}'")
             except Exception:
                 pass
             print("Keeping browser open. Press CTRL+C to stop.")
             try:
                 while True:
-                    page.wait_for_timeout(1000)
+                    try:
+                        page.wait_for_timeout(1000)
+                    except Exception:
+                        # Browser was closed by user — exit gracefully
+                        break
             except KeyboardInterrupt:
+                pass
+            finally:
                 try:
                     wb.save(args.output)
                 except Exception:
                     pass
-        browser.close()
+        try:
+            browser.close()
+        except Exception:
+            pass
 
     try:
         wb.save(args.output)
